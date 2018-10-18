@@ -1,12 +1,26 @@
+/*
+  Logentries client that supports POSTing to an HTTP endpoint. The `write`
+  method has been modified to use a client-provided low-level `writer` function
+  to send HTTP requests (`writer` in the opts object). It must take these
+  arguments:
+    - the HTTP endpoint to which to log
+    - the HTTP request body (as a UTF-8-encoded Buffer)
+  It must write the request to the endpoint with 'Content-Type' of
+ 'application/json', and resolve on response status 204, or reject.
+
+ This is forked from mainline le_node. The essential modifications are in the
+ `write` method, with minor modifications elsewhere, and the wholesale removal
+ of functionality used to maintain the health of the (former) TCP socket.
+
+ This is implemented as it's own package rather than trying to refactor the
+ original `Logger` to serve both purposes to ease the integration of upstream
+ updates. If you want to log to a socket, use mainline `le_node`.
+*/
 import _ from 'lodash';
 import semver from 'semver';
 import os from 'os';
-import net from 'net';
-import tls from 'tls';
-import urlUtil from 'url';
 import { Writable } from 'stream';
 import codependency from 'codependency';
-import reconnectCore from 'reconnect-core';
 import * as defaults from './defaults';
 import * as levelUtil from './levels';
 import text from './text';
@@ -19,7 +33,6 @@ import RingBuffer from './ringbuffer';
 import BunyanStream from './bunyanstream';
 
 // patterns
-const newline = /\n/g;
 const tokenPattern = /[a-f\d]{8}-([a-f\d]{4}-){3}[a-f\d]{12}/;
 
 // exposed Logger events
@@ -33,15 +46,6 @@ const finishWritableEvent = 'finish';
 const pipeWritableEvent = 'pipe';
 const unpipeWritableEvent = 'unpipe';
 const bufferDrainEvent = 'buffer drain';
-
-/**
- * Append log string to provided token.
- *
- * @param log
- * @param token
- */
-const finalizeLogString = (log, token) =>
-    `${token} ${log.toString().replace(newline, '\u2028')}\n`;
 
 /**
  * Get console method corresponds to lvl
@@ -75,7 +79,6 @@ const getSafeProp = (log, prop) => {
 
 const requirePeer = codependency.register(module);
 
-
 /**
  * Logger class that handles parsing of logs and sending logs to Logentries.
  */
@@ -102,6 +105,14 @@ class Logger extends Writable {
       throw new BadOptionsError(opts, text.invalidToken(opts.token));
     }
 
+    if (_.isUndefined(opts.writer)) {
+      throw new BadOptionsError(opts, text.noWriter());
+    }
+
+    if (!_.isFunction(opts.writer)) {
+      throw new BadOptionsError(opts, text.invalidWriter(opts.writer));
+    }
+
     // Log method aliases
     this.levels = levelUtil.normalize(opts);
 
@@ -120,7 +131,6 @@ class Logger extends Writable {
     }
 
     // boolean options
-    this.secure = opts.secure === undefined ? defaults.secure : opts.secure;
     this.debugEnabled = opts.debug === undefined ? defaults.debug : opts.debug;
     this.json = opts.json;
     this.flatten = opts.flatten;
@@ -133,17 +143,13 @@ class Logger extends Writable {
 
     // string or numeric options
     this.bufferSize = opts.bufferSize || defaults.bufferSize;
-    this.port = opts.port || (this.secure ? defaults.portSecure : defaults.port);
-    this.host = opts.host;
     this.minLevel = opts.minLevel;
     this.replacer = opts.replacer;
-    this.inactivityTimeout = opts.inactivityTimeout || defaults.inactivityTimeout;
-    this.disableTimeout = opts.disableTimeout;
     this.token = opts.token;
-    this.reconnectInitialDelay = opts.reconnectInitialDelay || defaults.reconnectInitialDelay;
-    this.reconnectMaxDelay = opts.reconnectMaxDelay || defaults.reconnectMaxDelay;
-    this.reconnectBackoffStrategy =
-        opts.reconnectBackoffStrategy || defaults.reconnectBackoffStrategy;
+    this.endpoint = `https://webhook.logentries.com/noformat/logs/${this.token}`;
+
+    // low-level writer function
+    this.writer = opts.writer;
 
     if (!this.debugEnabled) {
       // if there is no debug set, empty logger should be used
@@ -156,28 +162,7 @@ class Logger extends Writable {
           (opts.debugLogger && opts.debugLogger.log) ? opts.debugLogger : defaults.debugLogger;
     }
 
-    const isSecure = this.secure;
     this.ringBuffer = new RingBuffer(this.bufferSize);
-    this.reconnect = reconnectCore(function initialize() {
-      let connection;
-      const args = [].slice.call(arguments);
-      if (isSecure) {
-        connection = tls.connect.apply(tls, args, () => {
-          if (!connection.authorized) {
-            const errMsg = connection.authorizationError;
-            this.emit(new LogentriesError(text.authError(errMsg)));
-          } else if (tls && tls.CleartextStream && connection instanceof tls.CleartextStream) {
-            this.emit('connect');
-          }
-        });
-      } else {
-        connection = net.connect.apply(null, args);
-      }
-      if (!opts.disableTimeout) {
-        connection.setTimeout(opts.inactivityTimeout || defaults.inactivityTimeout);
-      }
-      return connection;
-    });
 
     // RingBuffer emits buffer shift event, meaning we are discarding some data!
     this.ringBuffer.on('buffer shift', () => {
@@ -188,55 +173,46 @@ class Logger extends Writable {
       this.debugLogger.log('RingBuffer drained.');
       this.drained = true;
     });
-
-    this.on(timeoutEvent, () => {
-      if (this.drained) {
-        this.debugLogger.log(
-            `Socket was inactive for ${this.inactivityTimeout / 1000} seconds. Destroying.`);
-        this.closeConnection();
-      } else {
-        this.debugLogger.log('Inactivity timeout event emitted but buffer was not drained.');
-        this.once(bufferDrainEvent, () => {
-          this.debugLogger.log('Buffer drain event emitted for inactivity timeout.');
-          this.closeConnection();
-        });
-      }
-    });
   }
 
   /**
    * Override Writable _write method.
-   * Get the connection promise .then write the next log on the ringBuffer
-   * to Logentries connection when its available
+   * Write POST one log record to the endpoint.
    */
   _write(ch, enc, cb) {
     this.drained = false;
-    this.connection.then(conn => {
+    try {
       const record = this.ringBuffer.read();
       if (record) {
-        // we are checking the buffer state here just after conn.write()
-        // to make sure the last event is sent to socket.
+        let promise = this.writer(this.endpoint, record);
         if (this.ringBuffer.isEmpty()) {
-          conn.write(record, () => {
-            process.nextTick(() => {
-              this.emit(bufferDrainEvent);
-              // this event is DEPRECATED - will be removed in next major release.
-              // new users should use 'buffer drain' event instead.
-              this.emit('connection drain');
+          // we are checking the buffer state here just after POSTing
+          // to make sure the last event is sent.
+          promise = promise
+            .then(() => {
+              process.nextTick(() => {
+                this.emit(bufferDrainEvent);
+                // this event is DEPRECATED - will be removed in next major release.
+                // new users should use 'buffer drain' event instead.
+                this.emit('connection drain');
+              });
             });
-          });
-        } else {
-          conn.write(record);
         }
+        promise
+          .catch(err => {
+            this.emit(errorEvent, err);
+            this.debugLogger.log(`Error: ${err}`);
+          })
+          .then(cb);
       } else {
         this.debugLogger.log('This should not happen. Read from ringBuffer returned null.');
+        cb();
       }
-      cb();
-    }).catch(err => {
+    } catch (err) {
       this.emit(errorEvent, err);
       this.debugLogger.log(`Error: ${err}`);
       cb();
-    });
+    }
   }
 
   setDefaultEncoding() { /* no. */
@@ -351,23 +327,9 @@ class Logger extends Writable {
     // if RingBuffer.write returns false, don't create any other write request for
     // the writable stream to avoid memory leak this means there are already 'bufferSize'
     // of write events in the writable stream and that's what we want.
-    if (this.ringBuffer.write(finalizeLogString(modifiedLog, this.token))) {
+    if (this.ringBuffer.write(Buffer.from(modifiedLog.toString()))) {
       this.write();
     }
-  }
-
-  /**
-   * Close connection via reconnection
-   */
-  closeConnection() {
-    this.debugLogger.log('Closing retry mechanism along with its connection.');
-    if (!this.reconnection) {
-      this.debugLogger.log('No reconnection instance found. Returning.');
-      return;
-    }
-    // this makes sure retry mechanism and connection will be closed.
-    this.reconnection.disconnect();
-    this.connection = null;
   }
 
   // Private methods
@@ -383,91 +345,6 @@ class Logger extends Writable {
     const name = this.levels[num];
 
     return name ? [num, name] : [];
-  }
-
-  get reconnect() {
-    return this._reconnect;
-  }
-
-  set reconnect(func) {
-    this._reconnect = func;
-  }
-
-  get connection() {
-    // The $connection property is a promise. On error, manual close, or
-    // inactivityTimeout, it deletes itself.
-    if (this._connection) {
-      return this._connection;
-    }
-
-    this.debugLogger.log('No connection exists. Creating a new one.');
-    // clear the state of previous reconnection and create a new one with a new connection promise.
-    if (this.reconnection) {
-      // destroy previous reconnection instance if it exists.
-      this.reconnection.disconnect();
-      this.reconnection = null;
-    }
-
-    this.reconnection = this.reconnect({
-      // all options are optional
-      initialDelay: this.reconnectInitialDelay,
-      maxDelay: this.reconnectMaxDelay,
-      strategy: this.reconnectBackoffStrategy,
-      failAfter: Infinity,
-      randomisationFactor: 0,
-      immediate: false
-    });
-
-    this.connection = new Promise((resolve) => {
-      const connOpts = {
-        host: this.host,
-        port: this.port
-      };
-
-      // reconnection listeners
-      this.reconnection.on('connect', (connection) => {
-        this.debugLogger.log('Connected');
-        this.emit(connectedEvent);
-
-        // connection listeners
-        connection.on('timeout', () => {
-          this.emit(timeoutEvent);
-        });
-        resolve(connection);
-      });
-
-      this.reconnection.on('reconnect', (n, delay) => {
-        if (n > 0) {
-          this.debugLogger.log(`Trying to reconnect. Times: ${n} , previous delay: ${delay}`);
-        }
-      });
-
-      this.reconnection.once('disconnect', () => {
-        this.debugLogger.log('Socket was disconnected');
-        this.connection = null;
-        this.emit(disconnectedEvent);
-      });
-
-      this.reconnection.on('error', (err) => {
-        this.debugLogger.log(`Error occurred during connection: ${err}`);
-      });
-
-      // now try to connect
-      this.reconnection.connect(connOpts);
-    });
-    return this.connection;
-  }
-
-  set connection(obj) {
-    this._connection = obj;
-  }
-
-  get reconnection() {
-    return this._reconnection;
-  }
-
-  set reconnection(func) {
-    this._reconnection = func;
   }
 
   get debugEnabled() {
@@ -492,14 +369,6 @@ class Logger extends Writable {
 
   set ringBuffer(obj) {
     this._ringBuffer = obj;
-  }
-
-  get secure() {
-    return this._secure;
-  }
-
-  set secure(val) {
-    this._secure = !!val;
   }
 
   get token() {
@@ -552,55 +421,12 @@ class Logger extends Writable {
     this.serialize = build(this);
   }
 
-  get host() {
-    return this._host;
-  }
-
-  set host(val) {
-    if (!_.isString(val) || !val.length) {
-      this._host = defaults.host;
-      return;
-    }
-
-    const host = val.replace(/^https?:\/\//, '');
-
-    const url = urlUtil.parse(`http://${host}`);
-
-    this._host = url.hostname || defaults.host;
-
-    if (url.port) this.port = url.port;
-  }
-
   get json() {
     return this._json;
   }
 
   set json(val) {
     this._json = val;
-  }
-
-  get reconnectMaxDelay() {
-    return this._reconnectMaxDelay;
-  }
-
-  set reconnectMaxDelay(val) {
-    this._reconnectMaxDelay = val;
-  }
-
-  get reconnectInitialDelay() {
-    return this._reconnectInitialDelay;
-  }
-
-  set reconnectInitialDelay(val) {
-    this._reconnectInitialDelay = val;
-  }
-
-  get reconnectBackoffStrategy() {
-    return this._reconnectBackoffStrategy;
-  }
-
-  set reconnectBackoffStrategy(val) {
-    this._reconnectBackoffStrategy = val;
   }
 
   get minLevel() {
@@ -613,15 +439,6 @@ class Logger extends Writable {
     this._minLevel = _.isNumber(num) ? num : 0;
   }
 
-  get port() {
-    return this._port;
-  }
-
-  set port(val) {
-    const port = parseFloat(val);
-    if (Number.isInteger(port) && _.inRange(port, 65536)) this._port = port;
-  }
-
   get replacer() {
     return this._replacer;
   }
@@ -629,20 +446,6 @@ class Logger extends Writable {
   set replacer(val) {
     this._replacer = _.isFunction(val) ? val : undefined;
     this.serialize = build(this);
-  }
-
-  get inactivityTimeout() {
-    return this._inactivityTimeout;
-  }
-
-  set inactivityTimeout(val) {
-    if (Number.isInteger(val) && val >= 0) {
-      this._inactivityTimeout = parseInt(val, 10);
-    }
-
-    if (!_.isNumber(this._inactivityTimeout)) {
-      this._inactivityTimeout = defaults.inactivityTimeout;
-    }
   }
 
   get timestamp() {
@@ -684,14 +487,6 @@ class Logger extends Writable {
 
   set levels(val) {
     this._levels = val;
-  }
-
-  get disableTimeout() {
-    return this._disableTimeout;
-  }
-
-  set disableTimeout(val) {
-    this._disableTimeout = !!val;
   }
 
   // Deprecated (to support migrants from le_node)

@@ -15,6 +15,9 @@ export default {
   invalidToken: token =>
       `The opts.token property "${token}" does not appear to be valid.`,
 
+  invalidWriter: writer =>
+      `The opts.writer property "${writer}" does not appear to be valid (must be a function).`,
+
   levelConflict: name =>
       `The custom level name ${name} conflicts with a native property.`,
 
@@ -29,6 +32,9 @@ export default {
 
   noToken: () =>
       'The opts.token property is missing.',
+
+  noWriter: () =>
+      'The opts.writer property is missing.',
 
   optionsNotObj: type =>
       `The options argument is a ${type}.`,
