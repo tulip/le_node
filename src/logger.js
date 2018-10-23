@@ -203,7 +203,7 @@ class Logger extends Writable {
             this.emit(errorEvent, err);
             this.debugLogger.log(`Error: ${err}`);
           })
-          .then(cb);
+          .then(() => cb());
       } else {
         this.debugLogger.log('This should not happen. Read from ringBuffer returned null.');
         cb();
