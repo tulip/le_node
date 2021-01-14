@@ -32,6 +32,7 @@
   },
   "main": "lib/logger.js",
   "scripts": {
+    "build": "gobble build lib --force",
     "lint": "eslint src",
     "prepublish": "npm run build",
     "test": "npm run build && npm run lint && node test/test.js | tap-spec"
@@ -81,5 +82,9 @@
     "winston": "*",
     "winston1": "*",
     "winston2x": "*"
+  },
+  "resolutions": {
+    "
+    ": "1.2.9"
   }
 }
