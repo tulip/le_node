@@ -76,8 +76,5 @@
     "winston": "*",
     "winston1": "*",
     "winston2x": "*"
-  },
-  "resolutions": {
-    "fsevents": "1.2.9"
   }
 }
