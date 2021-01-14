@@ -31,12 +31,6 @@
     "url": "https://github.com/logentries/le_node.git"
   },
   "main": "lib/logger.js",
-  "scripts": {
-    "build": "gobble build lib --force",
-    "lint": "eslint src",
-    "prepublish": "npm run build",
-    "test": "npm run build && npm run lint && node test/test.js | tap-spec"
-  },
   "engines": {
     "iojs": ">=0.10",
     "node": ">=0.8.0",
